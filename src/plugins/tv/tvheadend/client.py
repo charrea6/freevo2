@@ -17,24 +17,21 @@ class Client(object):
         self._seq = 0
         self._requests = {}
         self.channels = []
-        self._programs = {}
+        self._channels_map = {}
+        self._events = {}
+        self.dvr_entries = DVREntries()
         self.connected = kaa.InProgress()
 
     @kaa.coroutine()
-    def connect(self, host):
+    def connect(self, host, sync_epg=True):
         self.host = host
         self.socket = kaa.Socket()
         self.socket.signals['read'].connect(self.__read)
         yield self.socket.connect((host, 9982))
         yield self.send('hello', htspversion=5, clientname='Freevo', clientversion='2.0git')
-        self.send('enableAsyncMetadata', epg=1, async=False)
+        self.send('enableAsyncMetadata', epg=sync_epg and 1 or 0, async=False)
         self.connected = kaa.InProgress()
         yield self.connected
-
-    @kaa.coroutine()
-    def stream(self, channel):
-        result = yield self.send('getTicket', channelId=channel['channelId'])
-        yield 'http://%s:9981%s?ticket=%s' % (self.host, result['path'], result['ticket'])
 
     def send(self, command, **args):
         async = args.pop('async', True)
@@ -120,18 +117,220 @@ class Client(object):
             self._data = self._data[4+length:]
 
     def event_eventAdd(self, result):
-        self._programs[result['eventId']] = result
+        e = Event(self, result)
+        self._events[result['eventId']] = e
+        c = e.channel
+        if c:
+            c.events.append(e)
+
+    def event_eventDelete(self, result):
+        e = self._events.get(result['eventId'])
+        if e:
+            c = e.channel
+            if c:
+                c.events.remove(e)
+            del self._events[result['eventId']]
+
+    def event_eventUpdate(self, result):
+        e = self._events.get(result['eventId'])
+        if e:
+            e.__dict__.update(result)
 
     def event_channelAdd(self, result):
-        self.channels.append(result)
+        c  = Channel(self, result)
+        self.channels.append(c)
+        self._channels_map[c.channelId] = c
+
+    def event_channelDelete(self, result):
+        c = self._channels_map.get(result['channelId'])
+        if c:
+            self.channels.remove(c)
+            del self._channels_map[result['channelId']]
+
+    def event_channelUpdate(self, result):
+        c = self._channels_map.get(result['channelId'])
+        if c:
+            c.__dict__.update(result)
+
+    def event_dvrEntryAdd(self, result):
+        d = DVREntry(self, result)
+        self.dvr_entries._entries[result['id']] = d
+
+    def event_dvrEntryDelete(self, result):
+        del self.dvr_entries._entries[result['id']]
+
+    def event_dvrEntryUpdate(self, result):
+        d = self.dvr_entries._entries[result['id']]
+        if d:
+            d.__dict__.update(result)
 
     def event_initialSyncCompleted(self, result):
         self.connected.finish(None)
 
+    @kaa.coroutine()
+    def get_disk_space(self):
+        result = yield self.send('getDiskSpace')
+        yield result['freediskspace'], result['totaldiskspace']
+
+    @kaa.coroutine()
+    def get_sys_time(self):
+        result = yield self.send('getSysTime')
+        yield result['time'], result['timezone']
+
+    @kaa.coroutine()
+    def check_conflict(self, **kwargs):
+        result = yield self.send('checkConflict', **kwargs)
+        if result['conflict']:
+            suggestions = []
+            for dqr in result['suggestions']:
+                array = []
+                for d in dqr:
+                    array.append(self.dvr_entries._entries[d])
+                suggestions.append(array)
+            yield suggestions
+
+
+class TVHEObject(object):
+    """Base class for all TVHeadend  Objects.
+    Handles updates that are sent from the server and stores a reference to the client connection.
+    """
+    def __init__(self, client, data):
+        self._client = client
+        self.__dict__.update(data)
+
+
+class Channel(TVHEObject):
+    """TVHeadend Channel,has all the same properties as described in the htsp protocol.
+    """
+    def __init__(self, client, data):
+        super(Channel, self).__init__(client, data)
+        self.events = []
+
+    @kaa.coroutine()
+    def stream(self):
+        result = yield self._client.send('getTicket', channelId=self.channelId)
+        yield 'http://%s:9981%s?ticket=%s' % (self.host, result['path'], result['ticket'])
+
+    @kaa.coroutine()
+    def record(self, start, stop, **kwargs):
+        result = yield self._client.send('addDvrEntry', channelId=self.channelId, start=start, stop=stop, **kwargs)
+        if result['success']:
+            yield result['id']
+        raise TVHEError(result['error'])
+
+    def check_conflict(self, start, stop):
+        return self._client.check_conflict(channelId=self.channelId, start=start, stop=stop)
+
+    @property
+    def event(self):
+        return self._client._events.get(self.eventId)
+
+    @property
+    def next_event(self):
+        return self._client._events.get(self.nextEventId)
+
+
+
+class Event(TVHEObject):
+    """TVHeadend Event,has all the same properties as described in the htsp protocol.
+    """
+    @property
+    def channel(self):
+        return self._client._channels_map.get(self.channelId)
+
+    @property
+    def next_event(self):
+        return self._client._events.get(self.nextEventId)
+
+    @property
+    def dvr_entry(self):
+        if hasattr(self, 'dvrId'):
+            return self._client.dvr_entries._entries[self.dvrId]
+
+    @kaa.coroutine()
+    def record(self, **kwargs):
+        result = yield self._client.send('addDvrEntry', eventId=self.eventId, **kwargs)
+        if result['success']:
+            yield self._client.dvr_entries._entries.get(result['id'],result['id'])
+        raise TVHEError(result['error'])
+
+    def check_conflict(self):
+        return self._client.check_conflict(eventId=self.eventId)
+
+
+
+class DVREntry(TVHEObject):
+    """TVHeadend DVR Entry,has all the same properties as described in the htsp protocol.
+    """
+    @kaa.coroutine()
+    def update(self, **kwargs):
+        result = yield self._client.send('updateDvrEntry', id=self.id, **kwargs)
+        if result['success']:
+            yield True
+        raise TVHEError(result['error'])
+
+    @kaa.coroutine()
+    def cancel(self):
+        result = yield self._client.send('cancelDvrEntry', id=self.id)
+        if result['success']:
+            yield True
+        raise TVHEError(result['error'])
+
+    @kaa.coroutine()
+    def delete(self):
+        result = yield self._client.send('deleteDvrEntry', id=self.id)
+        if result['success']:
+            yield True
+        raise TVHEError(result['error'])
+
+
+class DVREntries(object):
+    """Class to hold DVREntries and allow filter of those entries based on their state.
+    """
+    def __init__(self):
+        self._entries = {}
+
+    def __filter(self, state):
+        r = []
+        for e in self._entries.values():
+            if e.state == state:
+                r.append(e)
+        return r
+
+    @property
+    def all(self):
+        return self._entries.values()
+
+    @property
+    def completed(self):
+        return self.__filter('completed')
+
+    @property
+    def scheduled(self):
+        return self.__filter('scheduled')
+
+    @property
+    def recording(self):
+        return self.__filter('recording')
+
+    @property
+    def missed(self):
+        return self.__filter('missed')
+
+class TVHEError(Exception):
+    pass
 
 if __name__ == "__main__":
+    import time
+    import sys
+
+    if len(sys.argv) < 2:
+        print 'usage: %s <tvheadend hostname>'
+        sys.exit(1)
+
     log = logging.getLogger()
-    formatter = logging.Formatter('%(levelname)s %(module)s(%(lineno)s): %(message)s')
+    log.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)-15s %(levelname)s %(module)s(%(lineno)s): %(message)s')
     handler = logging.StreamHandler()
     handler.setFormatter(formatter)
     log.addHandler(handler)
@@ -139,8 +338,37 @@ if __name__ == "__main__":
     @kaa.coroutine()
     def main():
         tv = Client()
-        yield tv.connect('raspberrypi')
-        print (yield tv.stream(tv.channels[6]))
+        yield tv.connect(sys.argv[1])
+        free_space, total_space = yield tv.get_disk_space()
+        print '%d/%d (%d%% free)' % (free_space, total_space, (free_space * 100) / total_space)
+        print '%d channels' % len(tv.channels)
+        channel = None
+        for c in tv.channels:
+            print '%s: %d events' % (c.channelName,len(c.events))
+            if len(c.events) > 3:
+                channel = c
 
+        if channel is not None:
+            print 'Selected channel', channel.channelName
+            now = time.time()
+
+            for e in channel.events:
+                if e.start > now + (10*60):
+                    event = e
+                    break
+            print 'Recording ', event.title
+            conflicts = yield event.check_conflict()
+            print 'Conflicts?', conflicts
+            dvr = yield event.record()
+            print 'DVREntry id', dvr.id
+
+            for d in tv.dvr_entries.scheduled:
+                if d.id == dvr.id:
+                    print 'Found our recording!'
+                    success = yield  d.delete()
+                    if success:
+                        print 'Delete recording'
+
+        kaa.main.stop()
     main()
     kaa.main.run()
